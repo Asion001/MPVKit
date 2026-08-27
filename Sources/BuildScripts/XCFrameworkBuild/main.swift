@@ -402,6 +402,16 @@ private class BuildMPV: BaseBuild {
         } else {
             array.append("-Dgpl=false")
         }
+
+        // MetalFX.framework does not exist in the simulator SDKs, so the
+        // upscaling pass has to be compiled out there or nothing that links
+        // the simulator slice will resolve MTLFXSpatialScaler.
+        switch platform {
+        case .isimulator, .tvsimulator, .xrsimulator:
+            array.append("-Dmetalfx=disabled")
+        default:
+            array.append("-Dmetalfx=enabled")
+        }
         let blurayLibPath = URL.currentDirectory + [Library.libbluray.rawValue, platform.rawValue, "thin", arch.rawValue]
         if FileManager.default.fileExists(atPath: blurayLibPath.path) {
             array.append("-Dlibbluray=enabled")

@@ -42,6 +42,38 @@ no timeline. The pass therefore calls `pl_gpu_finish()` and waits for the MetalF
 which serializes the GPU once per frame. Replacing that with an external semaphore
 (`pl_vulkan_hold_ex` / `pl_vulkan_release_ex`) is the obvious next optimization.
 
+## Why this fork hosts every framework
+
+Upstream MPVKit builds every framework slice as a shallow bundle, with `Info.plist` at the bundle
+root. That is correct for iOS, but Xcode refuses to embed a shallow framework into a Mac Catalyst
+app:
+
+```
+Framework ... contains Info.plist, expected Versions/Current/Resources/Info.plist
+since the platform does not use shallow bundles
+```
+
+Every embedded framework hits this, not just libmpv, so the fork re-hosts all 30 non-GPL binary
+targets with their Mac Catalyst slices converted to versioned bundles by
+`Scripts/fix-catalyst-bundles.py`. The GPL variants are unused by Swiftfin and still point at
+upstream.
+
+Only libmpv and FFmpeg are rebuilt from source here; the rest are upstream artifacts that are
+downloaded, repackaged, and re-uploaded unchanged apart from the Catalyst bundle layout. The
+`tvos` and `xros` slices are passed through as upstream built them.
+
+## Consuming the framework
+
+`MetalFX.framework` is absent from the simulator SDKs, so the simulator slices are built with
+`-Dmetalfx=disabled` and the framework is **not** declared in `Package.swift` — SwiftPM cannot
+express "device but not simulator". Apps linking the device or Mac Catalyst slices must add it
+themselves, for example:
+
+```
+OTHER_LDFLAGS[sdk=iphoneos*] = -framework MetalFX
+OTHER_LDFLAGS[sdk=macosx*]   = -framework MetalFX
+```
+
 ## Building
 
 ```
