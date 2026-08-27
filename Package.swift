@@ -26,6 +26,9 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudio"),
+                // libmpv is static and vo_gpu_next's MetalFX pass references
+                // MTLFXSpatialScaler, so consumers have to link MetalFX.
+                .linkedFramework("MetalFX"),
             ]
         ),
         .target(
@@ -63,6 +66,9 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudio"),
+                // libmpv is static and vo_gpu_next's MetalFX pass references
+                // MTLFXSpatialScaler, so consumers have to link MetalFX.
+                .linkedFramework("MetalFX"),
             ]
         ),
         .target(
