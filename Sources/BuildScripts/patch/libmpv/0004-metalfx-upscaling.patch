@@ -1,0 +1,604 @@
+diff --git a/meson.build b/meson.build
+index 42ece8e..60591f0 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1341,6 +1341,22 @@ if host_machine.system() == 'darwin'
+     endif
+ endif
+ 
++if host_machine.system() == 'darwin'
++    metalfx_opt = get_option('metalfx').require(
++        features['vulkan'],
++        error_message: 'MetalFX upscaling requires the vulkan renderer!',
++    )
++    metalfx = dependency('appleframeworks', modules: ['MetalFX', 'Metal'],
++                         required: metalfx_opt)
++    features += {'metalfx': metalfx.found()}
++    if features['metalfx']
++        dependencies += metalfx
++        sources += files('video/out/metalfx.m')
++    endif
++else
++    features += {'metalfx': false}
++endif
++
+ features += {'vk-khr-display': vulkan.type_name() == 'internal' or
+                                cc.has_function('vkCreateDisplayPlaneSurfaceKHR', prefix: '#include <vulkan/vulkan_core.h>',
+                                                dependencies: [vulkan])}
+diff --git a/meson.options b/meson.options
+index 81bc931..7331484 100644
+--- a/meson.options
++++ b/meson.options
+@@ -103,6 +103,7 @@ option('gl-dxinterop-d3d9', type: 'feature', value: 'auto', description: 'OpenGL
+ option('ios-gl', type: 'feature', value: 'auto', description: 'iOS OpenGL ES interop support')
+ option('videotoolbox-gl', type: 'feature', value: 'auto', description: 'Videotoolbox with OpenGL')
+ option('videotoolbox-pl', type: 'feature', value: 'auto', description: 'Videotoolbox with libplacebo')
++option('metalfx', type: 'feature', value: 'auto', description: 'MetalFX spatial upscaling in vo_gpu_next')
+ option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
+ 
+ # macOS features
+diff --git a/video/out/metalfx.h b/video/out/metalfx.h
+new file mode 100644
+index 0000000..477a000
+--- /dev/null
++++ b/video/out/metalfx.h
+@@ -0,0 +1,51 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++
++#include "common/msg.h"
++
++// A MetalFX spatial upscaling pass, used by vo_gpu_next to scale the video
++// plane before libplacebo composites subtitles and OSD over it.
++//
++// Textures are allocated here and handed to libplacebo through
++// PL_HANDLE_MTL_TEX imports, so both APIs address the same memory and no copy
++// is needed between the render pass and the upscaler.
++struct mp_metalfx;
++
++struct mp_metalfx *mp_metalfx_create(struct mp_log *log);
++void mp_metalfx_destroy(struct mp_metalfx **ctx);
++
++// Whether MetalFX can scale from the given size to the given size on this
++// device. MetalFX imposes its own minimums and maximums.
++bool mp_metalfx_supported(struct mp_metalfx *ctx, int in_w, int in_h,
++                          int out_w, int out_h);
++
++// Allocates a private MTLTexture. `is_output` selects the usage flags MetalFX
++// requires for its destination. Returns a retained id<MTLTexture> as a void *,
++// or NULL. Free with mp_metalfx_texture_release().
++void *mp_metalfx_texture_create(struct mp_metalfx *ctx, int w, int h,
++                                bool is_output);
++void mp_metalfx_texture_release(void *tex);
++
++// Encodes and commits a spatial upscale. Blocks until the GPU is done, because
++// the caller hands the result straight back to libplacebo's Vulkan queue,
++// which is a different MTLCommandQueue with no shared timeline.
++bool mp_metalfx_upscale(struct mp_metalfx *ctx, void *src, void *dst,
++                        float sharpness);
+diff --git a/video/out/metalfx.m b/video/out/metalfx.m
+new file mode 100644
+index 0000000..17a622d
+--- /dev/null
++++ b/video/out/metalfx.m
+@@ -0,0 +1,222 @@
++/*
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * mpv is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <Metal/Metal.h>
++#include <MetalFX/MetalFX.h>
++
++#include "mpv_talloc.h"
++#include "video/out/metalfx.h"
++
++// libplacebo renders into these textures over Vulkan, and MetalFX reads and
++// writes them over Metal, so both usages must be declared up front.
++#define MP_METALFX_PIXEL_FORMAT MTLPixelFormatRGBA16Float
++
++// mpv builds Objective-C without ARC, so every object here is retained and
++// released by hand and the `id` fields below are unmanaged.
++struct mp_metalfx {
++    struct mp_log *log;
++    id<MTLDevice> device;
++    id<MTLCommandQueue> queue;
++
++    // Scalers are expensive to build, so the last one is kept and reused for
++    // as long as the geometry is unchanged. Held as a bare `id` because
++    // MTLFXSpatialScaler is newer than mpv's deployment target.
++    id scaler;
++    int scaler_in_w, scaler_in_h;
++    int scaler_out_w, scaler_out_h;
++};
++
++struct mp_metalfx *mp_metalfx_create(struct mp_log *log)
++{
++    if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++        // MetalFX exists; fall through.
++    } else {
++        mp_err(log, "MetalFX requires macOS 13, iOS 16, or newer.\n");
++        return NULL;
++    }
++
++    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++    if (!device) {
++        mp_err(log, "No Metal device available.\n");
++        return NULL;
++    }
++
++    if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++        if (![MTLFXSpatialScalerDescriptor supportsDevice:device]) {
++            mp_err(log, "MetalFX spatial scaling is unsupported on this device.\n");
++            [device release];
++            return NULL;
++        }
++    }
++
++    id<MTLCommandQueue> queue = [device newCommandQueue];
++    if (!queue) {
++        mp_err(log, "Could not create a Metal command queue.\n");
++        return NULL;
++    }
++
++    struct mp_metalfx *ctx = talloc_zero(NULL, struct mp_metalfx);
++    ctx->log = log;
++    ctx->device = device;
++    ctx->queue = queue;
++    return ctx;
++}
++
++void mp_metalfx_destroy(struct mp_metalfx **pctx)
++{
++    struct mp_metalfx *ctx = *pctx;
++    if (!ctx)
++        return;
++
++    [ctx->scaler release];
++    [ctx->queue release];
++    [ctx->device release];
++    ctx->scaler = nil;
++    ctx->queue = nil;
++    ctx->device = nil;
++    talloc_free(ctx);
++    *pctx = NULL;
++}
++
++bool mp_metalfx_supported(struct mp_metalfx *ctx, int in_w, int in_h,
++                          int out_w, int out_h)
++{
++    if (!ctx)
++        return false;
++
++    // MetalFX only upscales; equal or shrinking sizes must take the normal
++    // single pass instead.
++    if (in_w <= 0 || in_h <= 0 || out_w <= in_w || out_h <= in_h)
++        return false;
++
++    return true;
++}
++
++API_AVAILABLE(macos(13.0), ios(16.0), tvos(16.0))
++static id<MTLFXSpatialScaler> get_scaler(struct mp_metalfx *ctx, int in_w,
++                                         int in_h, int out_w, int out_h)
++{
++    if (ctx->scaler && ctx->scaler_in_w == in_w && ctx->scaler_in_h == in_h &&
++        ctx->scaler_out_w == out_w && ctx->scaler_out_h == out_h)
++        return ctx->scaler;
++
++    MTLFXSpatialScalerDescriptor *desc =
++        [[MTLFXSpatialScalerDescriptor alloc] init];
++    desc.inputWidth = in_w;
++    desc.inputHeight = in_h;
++    desc.outputWidth = out_w;
++    desc.outputHeight = out_h;
++    desc.colorTextureFormat = MP_METALFX_PIXEL_FORMAT;
++    desc.outputTextureFormat = MP_METALFX_PIXEL_FORMAT;
++
++    // libplacebo has already converted to the target colorspace by this point,
++    // so the data MetalFX sees is display-referred.
++    desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
++
++    id<MTLFXSpatialScaler> scaler = [desc newSpatialScalerWithDevice:ctx->device];
++    [desc release];
++    if (!scaler) {
++        MP_ERR(ctx, "Could not create a MetalFX scaler for %dx%d -> %dx%d.\n",
++               in_w, in_h, out_w, out_h);
++        return nil;
++    }
++
++    [ctx->scaler release];
++    ctx->scaler = scaler;
++    ctx->scaler_in_w = in_w;
++    ctx->scaler_in_h = in_h;
++    ctx->scaler_out_w = out_w;
++    ctx->scaler_out_h = out_h;
++    return scaler;
++}
++
++void *mp_metalfx_texture_create(struct mp_metalfx *ctx, int w, int h,
++                                bool is_output)
++{
++    if (!ctx || w <= 0 || h <= 0)
++        return NULL;
++
++    @autoreleasepool {
++    MTLTextureDescriptor *desc = [MTLTextureDescriptor
++        texture2DDescriptorWithPixelFormat:MP_METALFX_PIXEL_FORMAT
++                                     width:w
++                                    height:h
++                                 mipmapped:NO];
++
++    // Render target for libplacebo, plus whichever side of the scaler this
++    // texture is on. Shader read is always needed: the upscaled texture is
++    // sampled again by the compositing pass.
++    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++    if (is_output)
++        desc.usage |= MTLTextureUsageShaderWrite;
++    desc.storageMode = MTLStorageModePrivate;
++
++    id<MTLTexture> tex = [ctx->device newTextureWithDescriptor:desc];
++    if (!tex) {
++        MP_ERR(ctx, "Could not allocate a %dx%d Metal texture.\n", w, h);
++        return NULL;
++    }
++
++    return (void *) tex;
++    }
++}
++
++void mp_metalfx_texture_release(void *tex)
++{
++    [(id<MTLTexture>) tex release];
++}
++
++bool mp_metalfx_upscale(struct mp_metalfx *ctx, void *src, void *dst,
++                        float sharpness)
++{
++    if (!ctx || !src || !dst)
++        return false;
++
++    id<MTLTexture> src_tex = (id<MTLTexture>) src;
++    id<MTLTexture> dst_tex = (id<MTLTexture>) dst;
++
++    if (@available(macOS 13.0, iOS 16.0, tvOS 16.0, *)) {
++    // The VO thread has no autorelease pool of its own, and -commandBuffer
++    // hands back an autoreleased object once per frame.
++    @autoreleasepool {
++        id<MTLFXSpatialScaler> scaler =
++            get_scaler(ctx, (int) src_tex.width, (int) src_tex.height,
++                       (int) dst_tex.width, (int) dst_tex.height);
++        if (!scaler)
++            return false;
++
++        scaler.colorTexture = src_tex;
++        scaler.outputTexture = dst_tex;
++
++        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
++        if (!cmd)
++            return false;
++
++        [scaler encodeToCommandBuffer:cmd];
++        [cmd commit];
++
++        // libplacebo's next pass runs on MoltenVK's own command queue, which
++        // shares no timeline with this one, so the upscale has to be finished
++        // before the texture is handed back.
++        [cmd waitUntilCompleted];
++
++        return cmd.status == MTLCommandBufferStatusCompleted;
++    }
++    }
++
++    return false;
++}
+diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
+index 2d95eb8..bf15dd1 100644
+--- a/video/out/vo_gpu_next.c
++++ b/video/out/vo_gpu_next.c
+@@ -41,6 +41,9 @@
+ #include "video/fmt-conversion.h"
+ #include "video/mp_image.h"
+ #include "video/out/placebo/ra_pl.h"
++#if HAVE_METALFX
++#include "video/out/metalfx.h"
++#endif
+ #include "placebo/utils.h"
+ #include "gpu/context.h"
+ #include "gpu/hwdec.h"
+@@ -145,6 +148,17 @@ struct priv {
+     const struct pl_hook **hooks; // storage for `params.hooks`
+     enum pl_color_levels output_levels;
+ 
++#if HAVE_METALFX
++    struct mp_metalfx *metalfx;
++    bool metalfx_failed;
++    // Intermediate render target and its upscaled counterpart. Both are
++    // MTLTextures imported into libplacebo, so the two APIs share memory.
++    pl_tex metalfx_src, metalfx_dst;
++    void *metalfx_src_mtl, *metalfx_dst_mtl;
++    int metalfx_src_w, metalfx_src_h;
++    int metalfx_dst_w, metalfx_dst_h;
++#endif
++
+     struct pl_icc_params icc_params;
+     char *icc_path;
+     pl_icc_object icc_profile;
+@@ -178,6 +192,11 @@ struct gl_next_opts {
+     int target_hint_mode;
+     bool target_hint_strict;
+     char **raw_opts;
++#if HAVE_METALFX
++    bool metalfx;
++    float metalfx_sharpness;
++    int metalfx_max_source_height;
++#endif
+ };
+ 
+ const struct m_opt_choice_alternatives lut_types[] = {
+@@ -218,6 +237,12 @@ const struct m_sub_options gl_next_conf = {
+         {"target-colorspace-hint-strict", OPT_BOOL(target_hint_strict)},
+         // No `target-lut-type` because we don't support non-RGB targets
+         {"libplacebo-opts", OPT_KEYVALUELIST(raw_opts)},
++#if HAVE_METALFX
++        {"metalfx", OPT_BOOL(metalfx)},
++        {"metalfx-sharpness", OPT_FLOAT(metalfx_sharpness), M_RANGE(0, 1)},
++        {"metalfx-max-source-height", OPT_INT(metalfx_max_source_height),
++            M_RANGE(0, 4320)},
++#endif
+         {0},
+     },
+     .defaults = &(struct gl_next_opts) {
+@@ -307,6 +332,137 @@ static struct mp_image *get_image(struct vo *vo, int imgfmt, int w, int h,
+     return mpi;
+ }
+ 
++#if HAVE_METALFX
++// Releases the imported MetalFX textures and their libplacebo views.
++static void metalfx_free_textures(struct priv *p)
++{
++    pl_tex_destroy(p->gpu, &p->metalfx_src);
++    pl_tex_destroy(p->gpu, &p->metalfx_dst);
++    mp_metalfx_texture_release(p->metalfx_src_mtl);
++    mp_metalfx_texture_release(p->metalfx_dst_mtl);
++    p->metalfx_src_mtl = NULL;
++    p->metalfx_dst_mtl = NULL;
++    p->metalfx_src_w = p->metalfx_src_h = 0;
++    p->metalfx_dst_w = p->metalfx_dst_h = 0;
++}
++
++// Imports one MTLTexture as a pl_tex that libplacebo can render into and
++// sample from. Mirrors what the VideoToolbox hwdec does for decoded frames.
++static pl_tex metalfx_import(struct priv *p, void *mtl_tex, int w, int h)
++{
++    pl_fmt fmt = pl_find_fmt(p->gpu, PL_FMT_FLOAT, 4, 16, 16,
++                             PL_FMT_CAP_RENDERABLE | PL_FMT_CAP_SAMPLEABLE);
++    if (!fmt) {
++        MP_ERR(p, "No renderable RGBA16F format for MetalFX.\n");
++        return NULL;
++    }
++
++    return pl_tex_create(p->gpu, pl_tex_params(
++        .w = w,
++        .h = h,
++        .format = fmt,
++        .sampleable = true,
++        .renderable = true,
++        .import_handle = PL_HANDLE_MTL_TEX,
++        .shared_mem = (struct pl_shared_mem) {
++            .handle = { .handle = mtl_tex },
++        },
++    ));
++}
++
++// Ensures both intermediate textures exist at the requested sizes.
++static bool metalfx_ensure_textures(struct priv *p, int src_w, int src_h,
++                                    int dst_w, int dst_h)
++{
++    if (p->metalfx_src && p->metalfx_dst &&
++        p->metalfx_src_w == src_w && p->metalfx_src_h == src_h &&
++        p->metalfx_dst_w == dst_w && p->metalfx_dst_h == dst_h)
++        return true;
++
++    metalfx_free_textures(p);
++
++    p->metalfx_src_mtl = mp_metalfx_texture_create(p->metalfx, src_w, src_h, false);
++    p->metalfx_dst_mtl = mp_metalfx_texture_create(p->metalfx, dst_w, dst_h, true);
++    if (!p->metalfx_src_mtl || !p->metalfx_dst_mtl)
++        goto fail;
++
++    p->metalfx_src = metalfx_import(p, p->metalfx_src_mtl, src_w, src_h);
++    p->metalfx_dst = metalfx_import(p, p->metalfx_dst_mtl, dst_w, dst_h);
++    if (!p->metalfx_src || !p->metalfx_dst)
++        goto fail;
++
++    p->metalfx_src_w = src_w;
++    p->metalfx_src_h = src_h;
++    p->metalfx_dst_w = dst_w;
++    p->metalfx_dst_h = dst_h;
++    return true;
++
++fail:
++    MP_WARN(p, "Could not set up MetalFX textures; using the normal pass.\n");
++    metalfx_free_textures(p);
++    return false;
++}
++
++// Whether this frame should take the MetalFX path.
++//
++// The video has to actually be upscaled, and the source has to be within the
++// height limit: MetalFX costs more than it gains once the source is already
++// close to the display size.
++static bool metalfx_wanted(struct priv *p, const struct pl_frame_mix *mix,
++                           int dst_w, int dst_h, int *src_w, int *src_h)
++{
++    if (!p->next_opts->metalfx || mix->num_frames < 1)
++        return false;
++
++    // The option is toggled at runtime, so the context is created on first use
++    // rather than at preinit. `metalfx_failed` keeps an unsupported device from
++    // retrying once per frame forever.
++    if (!p->metalfx) {
++        if (p->metalfx_failed)
++            return false;
++
++        p->metalfx = mp_metalfx_create(p->log);
++        if (!p->metalfx) {
++            p->metalfx_failed = true;
++            MP_WARN(p, "MetalFX is unavailable; upscaling stays off.\n");
++            return false;
++        }
++    }
++
++    const struct pl_frame *ref = mix->frames[0];
++    if (!ref || !ref->num_planes)
++        return false;
++
++    // Use the frame's crop rather than the plane size: panscan and aspect fill
++    // mean only part of the decoded frame reaches the screen, and upscaling the
++    // discarded part would both cost more and change the scale factor.
++    int w = (int) roundf(fabsf(pl_rect_w(ref->crop)));
++    int h = (int) roundf(fabsf(pl_rect_h(ref->crop)));
++    if (w <= 0 || h <= 0) {
++        w = ref->planes[0].texture ? ref->planes[0].texture->params.w : 0;
++        h = ref->planes[0].texture ? ref->planes[0].texture->params.h : 0;
++    }
++
++    // Rotation swaps what "width" means between the image and the target.
++    if (ref->rotation % PL_ROTATION_180 == PL_ROTATION_90)
++        MPSWAP(int, w, h);
++
++    if (w <= 0 || h <= 0)
++        return false;
++
++    int max_h = p->next_opts->metalfx_max_source_height;
++    if (max_h > 0 && h > max_h)
++        return false;
++
++    if (!mp_metalfx_supported(p->metalfx, w, h, dst_w, dst_h))
++        return false;
++
++    *src_w = w;
++    *src_h = h;
++    return true;
++}
++#endif
++
+ static void update_overlays(struct vo *vo, struct mp_osd_res res,
+                             int flags, enum pl_overlay_coords coords,
+                             struct osd_state *state, struct pl_frame *frame,
+@@ -1404,6 +1560,73 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+     }
+ 
+     // Render frame
++#if HAVE_METALFX
++    int mfx_src_w = 0, mfx_src_h = 0;
++    int mfx_dst_w = mp_rect_w(p->dst), mfx_dst_h = mp_rect_h(p->dst);
++    bool used_metalfx = false;
++
++    if (metalfx_wanted(p, &mix, mfx_dst_w, mfx_dst_h, &mfx_src_w, &mfx_src_h) &&
++        metalfx_ensure_textures(p, mfx_src_w, mfx_src_h, mfx_dst_w, mfx_dst_h))
++    {
++        // Pass 1: the video alone, at source resolution, in the target's
++        // colorspace. Overlays are deliberately left off `mid` so subtitles are
++        // not fed through the upscaler.
++        struct pl_frame mid = {
++            .num_planes = 1,
++            .planes[0] = {
++                .texture = p->metalfx_src,
++                .components = 4,
++                .component_mapping = {0, 1, 2, 3},
++            },
++            .color = target.color,
++            .repr = target.repr,
++            .crop = { 0, 0, mfx_src_w, mfx_src_h },
++        };
++
++        if (pl_render_image_mix(p->rr, &mix, &mid, &params)) {
++            // libplacebo's writes must land before Metal reads the texture.
++            pl_gpu_finish(gpu);
++
++            if (mp_metalfx_upscale(p->metalfx, p->metalfx_src_mtl,
++                                   p->metalfx_dst_mtl,
++                                   p->next_opts->metalfx_sharpness))
++            {
++                // Pass 2: composite the upscaled video and the overlays onto
++                // the swapchain, both at display resolution.
++                struct pl_frame upscaled = {
++                    .num_planes = 1,
++                    .planes[0] = {
++                        .texture = p->metalfx_dst,
++                        .components = 4,
++                        .component_mapping = {0, 1, 2, 3},
++                    },
++                    .color = target.color,
++                    .repr = target.repr,
++                    .crop = { 0, 0, mfx_dst_w, mfx_dst_h },
++                };
++
++                // Deliberately not `params`: hooks and user shaders already
++                // ran in pass 1, and running them again over the upscaled
++                // image would double-apply every shader in the chain.
++                struct pl_render_params blit_params = pl_render_fast_params;
++                blit_params.skip_anti_aliasing = true;
++
++                if (pl_render_image(p->rr, &upscaled, &target, &blit_params)) {
++                    used_metalfx = true;
++                    MP_TRACE(vo, "MetalFX: %dx%d -> %dx%d\n", mfx_src_w,
++                             mfx_src_h, mfx_dst_w, mfx_dst_h);
++                } else {
++                    MP_WARN(vo, "MetalFX compositing pass failed.\n");
++                }
++            }
++        }
++
++        if (!used_metalfx)
++            MP_WARN(vo, "MetalFX pass failed; using the normal pass.\n");
++    }
++
++    if (!used_metalfx)
++#endif
+     if (!pl_render_image_mix(p->rr, &mix, &target, &params)) {
+         MP_ERR(vo, "Failed rendering frame!\n");
+         goto done;
+@@ -2080,6 +2303,10 @@ done:
+ static void uninit(struct vo *vo)
+ {
+     struct priv *p = vo->priv;
++#if HAVE_METALFX
++    metalfx_free_textures(p);
++    mp_metalfx_destroy(&p->metalfx);
++#endif
+     pl_queue_destroy(&p->queue); // destroy this first
+     for (int i = 0; i < MP_ARRAY_SIZE(p->osd_state.entries); i++)
+         pl_tex_destroy(p->gpu, &p->osd_state.entries[i].tex);

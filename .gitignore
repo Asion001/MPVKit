@@ -121,3 +121,6 @@ dist/
 Package.resolved
 buildServer.json
 .vscode
+# Local build artifacts
+build-*.log
+dist/
