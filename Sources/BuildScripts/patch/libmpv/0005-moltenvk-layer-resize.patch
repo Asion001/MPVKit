@@ -1,0 +1,49 @@
+diff --git forkSrcPrefix/video/out/vulkan/context_moltenvk.m forkDstPrefix/video/out/vulkan/context_moltenvk.m
+index 445b907..5e82ac2 100644
+--- forkSrcPrefix/video/out/vulkan/context_moltenvk.m
++++ forkDstPrefix/video/out/vulkan/context_moltenvk.m
+@@ -81,8 +81,44 @@ static bool moltenvk_reconfig(struct ra_ctx *ctx)
+     return true;
+ }
+ 
++// The layer belongs to the host application, which resizes it whenever its own
++// layout changes. Nothing on that path reaches mpv: there is no window backend
++// here to raise VO_EVENT_RESIZE, and --android-surface-size, which is how the
++// other embedded backend drives VOCTRL_EXTERNAL_RESIZE, is not built on Apple
++// platforms. Without this, vo->dwidth and vo->dheight keep whatever the layer
++// measured when the file was configured while libplacebo rebuilds the swapchain
++// at the layer's real size, and the video keeps being drawn into a rectangle
++// that no longer lands on it.
++//
++// VOCTRL_CHECK_EVENTS runs once per VO thread iteration, so polling the layer
++// costs one property read per frame. The resize is done here rather than left to
++// the VO's own VO_EVENT_RESIZE handling because vo_gpu_next's resize() computes
++// its source and destination rectangles before it asks the context for the new
++// size; correcting the size first means those rectangles are right on the first
++// pass.
++//
++// Note that the VO thread sleeps when nothing is playing or being redrawn, so a
++// resize while paused is only noticed once something wakes it. A client that
++// resizes the layer should follow up with any property write to guarantee that.
+ static int moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    struct priv *p = ctx->priv;
++
++    if (request == VOCTRL_CHECK_EVENTS) {
++        CGSize s = p->layer.drawableSize;
++        int width = (int)s.width;
++        int height = (int)s.height;
++
++        if (width > 0 && height > 0 &&
++            (width != ctx->vo->dwidth || height != ctx->vo->dheight))
++        {
++            ra_vk_ctx_resize(ctx, width, height);
++            *events |= VO_EVENT_RESIZE;
++        }
++
++        return VO_TRUE;
++    }
++
+     return VO_NOTIMPL;
+ }
+ 

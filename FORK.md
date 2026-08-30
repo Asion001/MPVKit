@@ -6,6 +6,8 @@ This fork exists for one reason: to build libmpv with a MetalFX spatial upscalin
 ## What differs from upstream
 
 - `Sources/BuildScripts/patch/libmpv/0004-metalfx-upscaling.patch` — the MetalFX pass.
+- `Sources/BuildScripts/patch/libmpv/0005-moltenvk-layer-resize.patch` — lets the `moltenvk` context
+  notice that the host resized its `CAMetalLayer`.
 - `Package.swift` — the `Libmpv` binary target points at this fork's releases. Every other binary
   target still points at upstream `mpvkit`, so only libmpv is rebuilt here.
 - Upstream's GitHub workflows are removed. Builds are produced locally and uploaded to this fork's
@@ -41,6 +43,30 @@ libplacebo renders over MoltenVK's command queue while MetalFX runs on its own, 
 no timeline. The pass therefore calls `pl_gpu_finish()` and waits for the MetalFX command buffer,
 which serializes the GPU once per frame. Replacing that with an external semaphore
 (`pl_vulkan_hold_ex` / `pl_vulkan_release_ex`) is the obvious next optimization.
+
+## What the layer-resize patch does
+
+The `moltenvk` context reads `CAMetalLayer.drawableSize` only from `reconfig`, and its `control`
+answers `VO_NOTIMPL` to everything, so nothing turns a resize of the host's layer into a
+`VO_EVENT_RESIZE`. `--android-surface-size`, which drives `VOCTRL_EXTERNAL_RESIZE` for the other
+embedded backend, is behind `HAVE_EGL_ANDROID` and is not built here.
+
+The result is that `vo->dwidth` and `vo->dheight` keep the size the layer had when the file was
+configured, while libplacebo rebuilds the swapchain at whatever size the layer actually is. mpv goes
+on drawing the picture into a rectangle that no longer lands on the layer, so shrinking the player —
+which is what Swiftfin does when a supplement is presented in portrait — leaves mostly, or entirely,
+black.
+
+The patch handles `VOCTRL_CHECK_EVENTS`, which the VO thread issues once per iteration: it compares
+the layer's `drawableSize` against `vo->dwidth`/`vo->dheight`, calls `ra_vk_ctx_resize` when they
+differ, and raises `VO_EVENT_RESIZE`. Resizing before raising the event matters, because
+`vo_gpu_next`'s `resize()` computes its source and destination rectangles *before* it asks the
+context for the new size.
+
+The VO thread sleeps while nothing is playing or being redrawn, so a resize that happens while
+paused is only noticed once something wakes it. Swiftfin's `MPVClientCore.synchronizeWithLayerSize()`
+writes a video-position property after every drawable-size change, which both provides that wakeup
+and keeps unpatched builds working.
 
 ## Why this fork hosts every framework
 
