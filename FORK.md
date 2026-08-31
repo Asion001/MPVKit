@@ -34,8 +34,19 @@ between the render pass and the upscaler.
 | Option | Default | Meaning |
 |---|---|---|
 | `--metalfx` | `no` | Enable the MetalFX pass |
-| `--metalfx-sharpness` | `0` | Reserved for future sharpening control, `0`–`1` |
+| `--metalfx-sharpness` | `0` | Luminance unsharp mask over the upscaled picture, `0`–`1` |
 | `--metalfx-max-source-height` | `0` | Skip MetalFX above this source height; `0` means no limit |
+
+### Sharpening
+
+`MTLFXSpatialScaler` has no sharpening of its own, and a spatial upscale at the 1.2x-2.8x factors a
+phone actually asks for is close to invisible without one. `--metalfx-sharpness` adds a compute pass
+over the upscaled texture, encoded into the same command buffer as the scaler so it costs no extra
+GPU synchronisation.
+
+It sharpens luminance only. Sharpening each channel separately turns chroma noise into coloured
+speckle, and the correction is clamped rather than left proportional to the edge it found, which is
+what keeps halos off high-contrast edges.
 
 ### Known cost
 
