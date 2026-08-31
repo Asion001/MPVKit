@@ -25,6 +25,7 @@ index 42ece8e..60591f0 100644
  features += {'vk-khr-display': vulkan.type_name() == 'internal' or
                                 cc.has_function('vkCreateDisplayPlaneSurfaceKHR', prefix: '#include <vulkan/vulkan_core.h>',
                                                 dependencies: [vulkan])}
+
 diff --git a/meson.options b/meson.options
 index 81bc931..7331484 100644
 --- a/meson.options
@@ -37,12 +38,13 @@ index 81bc931..7331484 100644
  option('moltenvk', type: 'feature', value: 'auto', description: 'Moltenvk context')
  
  # macOS features
+
 diff --git a/video/out/metalfx.h b/video/out/metalfx.h
 new file mode 100644
-index 0000000..477a000
+index 0000000..aa53683
 --- /dev/null
 +++ b/video/out/metalfx.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -89,17 +91,21 @@ index 0000000..477a000
 +                                bool is_output);
 +void mp_metalfx_texture_release(void *tex);
 +
-+// Encodes and commits a spatial upscale. Blocks until the GPU is done, because
-+// the caller hands the result straight back to libplacebo's Vulkan queue,
-+// which is a different MTLCommandQueue with no shared timeline.
++// Encodes and commits a spatial upscale, followed by a luminance unsharp mask
++// when `sharpness` is above zero. MTLFXSpatialScaler has no sharpening of its
++// own, and without it the upscale is close to invisible at the factors a phone
++// asks for. Blocks until the GPU is done, because the caller hands the result
++// straight back to libplacebo's Vulkan queue, which is a different
++// MTLCommandQueue with no shared timeline.
 +bool mp_metalfx_upscale(struct mp_metalfx *ctx, void *src, void *dst,
 +                        float sharpness);
+
 diff --git a/video/out/metalfx.m b/video/out/metalfx.m
 new file mode 100644
-index 0000000..17a622d
+index 0000000..b07ac71
 --- /dev/null
 +++ b/video/out/metalfx.m
-@@ -0,0 +1,222 @@
+@@ -0,0 +1,392 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -140,7 +146,54 @@ index 0000000..17a622d
 +    id scaler;
 +    int scaler_in_w, scaler_in_h;
 +    int scaler_out_w, scaler_out_h;
++
++    // MTLFXSpatialScaler has no sharpening of its own, and spatial upscaling
++    // at the 1.2x-2.8x factors a phone asks for is close to invisible without
++    // it. This is the pass that puts the acutance back, compiled on first use
++    // and kept for the lifetime of the context.
++    id sharpen_pipeline;
++    bool sharpen_failed;
++
++    // The scaler writes here instead of straight to the destination when
++    // sharpening, because a compute kernel cannot read and write one texture
++    // at the same coordinates safely.
++    id sharpen_tex;
++    int sharpen_w, sharpen_h;
 +};
++
++// A luminance-only unsharp mask. Sharpening each channel separately turns
++// chroma noise into coloured speckle, which is what upscaling on this player
++// was first reported for.
++static const char *const mp_metalfx_sharpen_source =
++    "#include <metal_stdlib>\n"
++    "using namespace metal;\n"
++    "constant float3 luma_weights = float3(0.2126f, 0.7152f, 0.0722f);\n"
++    "kernel void mp_sharpen_luma(\n"
++    "    texture2d<float, access::read> src [[texture(0)]],\n"
++    "    texture2d<float, access::write> dst [[texture(1)]],\n"
++    "    constant float &amount [[buffer(0)]],\n"
++    "    uint2 gid [[thread_position_in_grid]])\n"
++    "{\n"
++    "    int w = int(src.get_width());\n"
++    "    int h = int(src.get_height());\n"
++    "    if (int(gid.x) >= w || int(gid.y) >= h)\n"
++    "        return;\n"
++    "    float4 centre = src.read(gid);\n"
++    "    float blurred = 0.0f;\n"
++    "    for (int dy = -1; dy <= 1; dy++) {\n"
++    "        for (int dx = -1; dx <= 1; dx++) {\n"
++    "            uint2 p = uint2(clamp(int(gid.x) + dx, 0, w - 1),\n"
++    "                            clamp(int(gid.y) + dy, 0, h - 1));\n"
++    "            float weight = 4.0f / exp2(float(abs(dx) + abs(dy)));\n"
++    "            blurred += weight * dot(src.read(p).rgb, luma_weights);\n"
++    "        }\n"
++    "    }\n"
++    "    blurred /= 16.0f;\n"
++    "    float detail = dot(centre.rgb, luma_weights) - blurred;\n"
++    "    float limit = 0.1f * amount;\n"
++    "    centre.rgb = max(centre.rgb + clamp(amount * detail, -limit, limit), 0.0f);\n"
++    "    dst.write(centre, gid);\n"
++    "}\n";
 +
 +struct mp_metalfx *mp_metalfx_create(struct mp_log *log)
 +{
@@ -185,9 +238,13 @@ index 0000000..17a622d
 +        return;
 +
 +    [ctx->scaler release];
++    [ctx->sharpen_pipeline release];
++    [ctx->sharpen_tex release];
 +    [ctx->queue release];
 +    [ctx->device release];
 +    ctx->scaler = nil;
++    ctx->sharpen_pipeline = nil;
++    ctx->sharpen_tex = nil;
 +    ctx->queue = nil;
 +    ctx->device = nil;
 +    talloc_free(ctx);
@@ -282,6 +339,108 @@ index 0000000..17a622d
 +    [(id<MTLTexture>) tex release];
 +}
 +
++// Compiles the sharpening kernel. Failure is recorded so a device that cannot
++// build it does not retry once per frame; upscaling then runs unsharpened
++// rather than not at all.
++static id<MTLComputePipelineState> get_sharpen_pipeline(struct mp_metalfx *ctx)
++{
++    if (ctx->sharpen_pipeline || ctx->sharpen_failed)
++        return ctx->sharpen_pipeline;
++
++    @autoreleasepool {
++    NSError *error = nil;
++    NSString *source =
++        [NSString stringWithUTF8String:mp_metalfx_sharpen_source];
++    id<MTLLibrary> library = [ctx->device newLibraryWithSource:source
++                                                       options:nil
++                                                         error:&error];
++    if (!library) {
++        MP_ERR(ctx, "Could not build the MetalFX sharpening kernel: %s\n",
++               error ? error.localizedDescription.UTF8String : "unknown error");
++        ctx->sharpen_failed = true;
++        return nil;
++    }
++
++    id<MTLFunction> function = [library newFunctionWithName:@"mp_sharpen_luma"];
++    [library release];
++    if (!function) {
++        MP_ERR(ctx, "The MetalFX sharpening kernel has no entry point.\n");
++        ctx->sharpen_failed = true;
++        return nil;
++    }
++
++    id<MTLComputePipelineState> pipeline =
++        [ctx->device newComputePipelineStateWithFunction:function error:&error];
++    [function release];
++    if (!pipeline) {
++        MP_ERR(ctx, "Could not create the MetalFX sharpening pipeline: %s\n",
++               error ? error.localizedDescription.UTF8String : "unknown error");
++        ctx->sharpen_failed = true;
++        return nil;
++    }
++
++    ctx->sharpen_pipeline = pipeline;
++    return pipeline;
++    }
++}
++
++// The scaler's own destination while sharpening. Kept for as long as the
++// output geometry is unchanged, like the scaler itself.
++static bool ensure_sharpen_texture(struct mp_metalfx *ctx, int w, int h)
++{
++    if (ctx->sharpen_tex && ctx->sharpen_w == w && ctx->sharpen_h == h)
++        return true;
++
++    @autoreleasepool {
++    MTLTextureDescriptor *desc = [MTLTextureDescriptor
++        texture2DDescriptorWithPixelFormat:MP_METALFX_PIXEL_FORMAT
++                                     width:w
++                                    height:h
++                                 mipmapped:NO];
++    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++    desc.storageMode = MTLStorageModePrivate;
++
++    id<MTLTexture> tex = [ctx->device newTextureWithDescriptor:desc];
++    if (!tex) {
++        MP_ERR(ctx, "Could not allocate a %dx%d sharpening texture.\n", w, h);
++        return false;
++    }
++
++    [ctx->sharpen_tex release];
++    ctx->sharpen_tex = tex;
++    ctx->sharpen_w = w;
++    ctx->sharpen_h = h;
++    return true;
++    }
++}
++
++static void encode_sharpen(struct mp_metalfx *ctx, id<MTLCommandBuffer> cmd,
++                           id<MTLComputePipelineState> pipeline,
++                           id<MTLTexture> src, id<MTLTexture> dst,
++                           float amount)
++{
++    id<MTLComputeCommandEncoder> encoder = [cmd computeCommandEncoder];
++    if (!encoder)
++        return;
++
++    [encoder setComputePipelineState:pipeline];
++    [encoder setTexture:src atIndex:0];
++    [encoder setTexture:dst atIndex:1];
++    [encoder setBytes:&amount length:sizeof(amount) atIndex:0];
++
++    NSUInteger width = pipeline.threadExecutionWidth;
++    NSUInteger height = pipeline.maxTotalThreadsPerThreadgroup / width;
++    MTLSize group = MTLSizeMake(width, height, 1);
++    MTLSize grid = MTLSizeMake(dst.width, dst.height, 1);
++
++    // Non-uniform threadgroups are unavailable before A11, and the kernel
++    // bounds-checks anyway, so dispatch whole groups.
++    MTLSize groups = MTLSizeMake((grid.width + width - 1) / width,
++                                 (grid.height + height - 1) / height, 1);
++    [encoder dispatchThreadgroups:groups threadsPerThreadgroup:group];
++    [encoder endEncoding];
++}
++
 +bool mp_metalfx_upscale(struct mp_metalfx *ctx, void *src, void *dst,
 +                        float sharpness)
 +{
@@ -301,14 +460,31 @@ index 0000000..17a622d
 +        if (!scaler)
 +            return false;
 +
++        // Sharpening reads what the scaler wrote, so the two cannot share one
++        // texture. When nothing is being sharpened the scaler writes the
++        // destination directly and no second texture is allocated at all.
++        id<MTLComputePipelineState> sharpen = nil;
++        if (sharpness > 0.0f &&
++            ensure_sharpen_texture(ctx, (int) dst_tex.width,
++                                   (int) dst_tex.height))
++        {
++            sharpen = get_sharpen_pipeline(ctx);
++        }
++
 +        scaler.colorTexture = src_tex;
-+        scaler.outputTexture = dst_tex;
++        scaler.outputTexture = sharpen ? ctx->sharpen_tex : dst_tex;
 +
 +        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
 +        if (!cmd)
 +            return false;
 +
 +        [scaler encodeToCommandBuffer:cmd];
++
++        if (sharpen) {
++            encode_sharpen(ctx, cmd, sharpen, ctx->sharpen_tex, dst_tex,
++                           sharpness);
++        }
++
 +        [cmd commit];
 +
 +        // libplacebo's next pass runs on MoltenVK's own command queue, which
@@ -322,6 +498,7 @@ index 0000000..17a622d
 +
 +    return false;
 +}
+
 diff --git a/video/out/vo_gpu_next.c b/video/out/vo_gpu_next.c
 index 2d95eb8..bf15dd1 100644
 --- a/video/out/vo_gpu_next.c
