@@ -102,10 +102,10 @@ index 0000000..aa53683
 
 diff --git a/video/out/metalfx.m b/video/out/metalfx.m
 new file mode 100644
-index 0000000..b07ac71
+index 0000000..7bf630a
 --- /dev/null
 +++ b/video/out/metalfx.m
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,395 @@
 +/*
 + * This file is part of mpv.
 + *
@@ -397,7 +397,10 @@ index 0000000..b07ac71
 +                                     width:w
 +                                    height:h
 +                                 mipmapped:NO];
-+    desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
++    // Render target as well as shader access: this is the scaler's own output
++    // texture while sharpening, and MTLFXSpatialScaler renders into it.
++    desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
++                 MTLTextureUsageShaderWrite;
 +    desc.storageMode = MTLStorageModePrivate;
 +
 +    id<MTLTexture> tex = [ctx->device newTextureWithDescriptor:desc];
